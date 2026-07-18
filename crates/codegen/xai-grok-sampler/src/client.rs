@@ -78,6 +78,55 @@ impl GrokRequestHeaders<'_> {
     }
 }
 
+fn normalize_output_content(value: &mut serde_json::Value, incremental: bool) {
+    let Some(content) = value.as_object_mut() else {
+        return;
+    };
+    match content.get("type").and_then(|v| v.as_str()) {
+        Some("output_text") => {
+            content
+                .entry("annotations")
+                .or_insert_with(|| serde_json::json!([]));
+        }
+        Some("summary_text") if incremental => {
+            content
+                .entry("text")
+                .or_insert_with(|| serde_json::json!(""));
+        }
+        _ => {}
+    }
+}
+
+fn normalize_output_item(value: &mut serde_json::Value, incremental: bool) {
+    let Some(item) = value.as_object_mut() else {
+        return;
+    };
+    match item.get("type").and_then(|v| v.as_str()) {
+        Some("message") => {
+            if incremental {
+                item.entry("content")
+                    .or_insert_with(|| serde_json::json!([]));
+            }
+            if let Some(parts) = item.get_mut("content").and_then(|v| v.as_array_mut()) {
+                for part in parts {
+                    normalize_output_content(part, false);
+                }
+            }
+        }
+        Some("function_call") if incremental => {
+            item.entry("arguments")
+                .or_insert_with(|| serde_json::json!(""));
+        }
+        Some("reasoning") => {
+            // Providers may omit an empty summary even on completed reasoning
+            // items when no summary was requested or generated.
+            item.entry("summary")
+                .or_insert_with(|| serde_json::json!([]));
+        }
+        _ => {}
+    }
+}
+
 /// Parse the `Retry-After` response header as delta-seconds.
 /// Our inference backends only emit integer seconds (never HTTP-date),
 /// so we only handle that form. HTTP-dates silently return `None` and
@@ -105,8 +154,52 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
-            // Try sanitizing: parse as Value, strip unknown tools, retry.
+            // Try sanitizing: parse as Value, fill provider-omitted defaults,
+            // strip unknown tools, and retry.
+            let mut final_err = first_err;
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
+                // Some OpenAI-compatible providers omit `output` and
+                // `status` from the initial response.created /
+                // response.in_progress snapshot. async-openai requires both,
+                // even though no output items exist yet and the status follows
+                // from the event type.
+                let event_type = value.get("type").and_then(|v| v.as_str());
+                let is_initial_response = matches!(
+                    event_type,
+                    Some("response.created" | "response.in_progress")
+                );
+                let is_output_item_added = event_type == Some("response.output_item.added");
+                let is_summary_part_added =
+                    event_type == Some("response.reasoning_summary_part.added");
+                if is_initial_response
+                    && let Some(response) =
+                        value.get_mut("response").and_then(|v| v.as_object_mut())
+                {
+                    response
+                        .entry("output")
+                        .or_insert_with(|| serde_json::json!([]));
+                    response
+                        .entry("status")
+                        .or_insert_with(|| serde_json::json!("in_progress"));
+                }
+
+                // Volcengine omits empty fields while incremental items are
+                // being announced. Do not relax validation for done events.
+                if let Some(item) = value.get_mut("item") {
+                    normalize_output_item(item, is_output_item_added);
+                }
+                if let Some(part) = value.get_mut("part") {
+                    normalize_output_content(part, is_summary_part_added);
+                }
+                if let Some(output) = value
+                    .pointer_mut("/response/output")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for item in output {
+                        normalize_output_item(item, false);
+                    }
+                }
+
                 // Strip tools that async_openai's rs::Tool can't deserialize
                 // (e.g., xAI-specific "x_search"). Instead of maintaining a
                 // hardcoded allowlist, try deserializing each tool entry —
@@ -117,17 +210,20 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
                 {
                     tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
                 }
-                if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
-                    apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
+                match serde_json::from_value::<rs::ResponseStreamEvent>(value) {
+                    Ok(mut event) => {
+                        apply_terminal_event_overrides(&mut event, data);
+                        return Ok(event);
+                    }
+                    Err(err) => final_err = err,
                 }
             }
             tracing::error!(
-                error = %first_err,
+                error = %final_err,
                 raw_data = %data,
                 "Failed to deserialize ResponseStreamEvent from stream"
             );
-            return Err(SamplingError::Serialization(first_err));
+            return Err(SamplingError::Serialization(final_err));
         }
     };
     apply_terminal_event_overrides(&mut event, data);
@@ -3031,6 +3127,94 @@ mod tests {
             crate::attribution::SamplingConsumer::ChatCompletions,
             Some("bearer-tail-12"),
         );
+    }
+
+    /// OpenAI-compatible providers may omit `response.output` and
+    /// `response.status` from the initial stream snapshot.
+    #[test]
+    fn deserialize_response_created_defaults_missing_initial_fields() {
+        let sse = r#"{
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "ark-code-latest"
+            }
+        }"#;
+
+        let event =
+            deserialize_response_event(sse).expect("missing initial fields should get defaults");
+        let rs::ResponseStreamEvent::ResponseCreated(event) = event else {
+            panic!("expected ResponseCreated");
+        };
+        assert!(event.response.output.is_empty());
+        assert!(matches!(event.response.status, rs::Status::InProgress));
+    }
+
+    #[test]
+    fn deserialize_volcengine_responses_stream_defaults_empty_collections() {
+        let fixtures = [
+            r#"{
+                "type":"response.output_item.added","output_index":0,
+                "item":{"id":"reasoning_1","type":"reasoning","status":"in_progress"},
+                "sequence_number":2
+            }"#,
+            r#"{
+                "type":"response.output_item.done","output_index":0,
+                "item":{"id":"reasoning_1","type":"reasoning","status":"completed"},
+                "sequence_number":3
+            }"#,
+            r#"{
+                "type":"response.reasoning_summary_part.added","item_id":"reasoning_1",
+                "output_index":0,"summary_index":0,"part":{"type":"summary_text"},
+                "sequence_number":3
+            }"#,
+            r#"{
+                "type":"response.output_item.added","output_index":0,
+                "item":{"call_id":"call_1","name":"project_info","type":"function_call",
+                "id":"fc_1","status":"in_progress"},"sequence_number":2
+            }"#,
+            r#"{
+                "type":"response.output_item.added","output_index":0,
+                "item":{"type":"message","role":"assistant","status":"in_progress","id":"msg_1"},
+                "sequence_number":2
+            }"#,
+            r#"{
+                "type":"response.content_part.added","content_index":0,"item_id":"msg_1",
+                "output_index":0,"part":{"type":"output_text","text":""},"sequence_number":3
+            }"#,
+            r#"{
+                "type":"response.output_item.done","output_index":0,
+                "item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"4"}],"status":"completed","id":"msg_1"},
+                "sequence_number":7
+            }"#,
+            r#"{
+                "type":"response.completed","response":{"created_at":0,"id":"resp_1",
+                "model":"ark-code-latest","object":"response","output":[{"type":"message",
+                "role":"assistant","content":[{"type":"output_text","text":"4"}],
+                "status":"completed","id":"msg_1"}],"status":"completed","usage":{"input_tokens":1,
+                "output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},
+                "output_tokens_details":{"reasoning_tokens":0}}},"sequence_number":8
+            }"#,
+        ];
+
+        for fixture in fixtures {
+            deserialize_response_event(fixture).expect("Volcengine stream event should parse");
+        }
+    }
+
+    #[test]
+    fn deserialize_response_event_keeps_done_items_strict() {
+        let missing_arguments = r#"{
+            "type":"response.output_item.done","output_index":0,
+            "item":{"call_id":"call_1","name":"project_info","type":"function_call",
+            "id":"fc_1","status":"completed"},"sequence_number":2
+        }"#;
+
+        let error = deserialize_response_event(missing_arguments).unwrap_err();
+        assert!(error.to_string().contains("missing field `arguments`"));
     }
 
     /// `response.completed` carrying
