@@ -131,6 +131,7 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(default)]
         signature: String,
     },
     /// Encrypted reasoning the model chose to redact. Carries only an opaque
@@ -347,6 +348,22 @@ pub struct StreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_block_defaults_missing_signature() {
+        let block: ContentBlock =
+            serde_json::from_str(r#"{"type":"thinking","thinking":"step by step"}"#)
+                .expect("provider-omitted signature should deserialize");
+        let ContentBlock::Thinking {
+            thinking,
+            signature,
+        } = block
+        else {
+            panic!("expected thinking block");
+        };
+        assert_eq!(thinking, "step by step");
+        assert!(signature.is_empty());
+    }
 
     #[test]
     fn stop_reason_deserializes_all_known_values_and_catches_unknown() {
